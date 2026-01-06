@@ -90,7 +90,8 @@ const botState = {
     startTime: null
   },
   
-  intervalId: null
+  intervalId: null,
+  lastSuccessfulFetch: null
 };
 
 // ============================================
@@ -186,14 +187,18 @@ async function fetchMarketData() {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
-    return await response.json();
+    const data = await response.json();
+    botState.lastSuccessfulFetch = Date.now();
+    return data;
   } catch (error) {
     addLog(`API error: ${error.message}`, 'error');
-    return [];
+    return null; // Return null to keep existing markets
   }
 }
 
 function processMarkets(events) {
+  if (!events || !Array.isArray(events)) return [];
+  
   const now = Date.now();
   const processed = [];
 
@@ -433,7 +438,14 @@ async function monitorMarkets() {
   if (!botState.isRunning) return;
   
   const events = await fetchMarketData();
-  botState.markets = processMarkets(events);
+  
+  // Only update markets if we got valid data
+  if (events !== null && Array.isArray(events)) {
+    const newMarkets = processMarkets(events);
+    if (newMarkets.length > 0 || events.length === 0) {
+      botState.markets = newMarkets;
+    }
+  }
   
   const { slugs, timeToEnd } = calculateCurrentSlugs();
   
@@ -467,12 +479,19 @@ async function monitorMarkets() {
 app.get('/api/state', (req, res) => {
   const { slugs, timeToEnd, endTimestamp } = calculateCurrentSlugs();
   
+  // Update time remaining for each market
+  const now = Date.now();
+  const marketsWithUpdatedTime = botState.markets.map(m => ({
+    ...m,
+    timeRemaining: (new Date(m.endDate).getTime() - now) / 1000
+  }));
+  
   res.json({
     isRunning: botState.isRunning,
     walletAddress: botState.wallet?.address || null,
     hasApiCredentials: !!botState.apiCredentials,
     settings: botState.settings,
-    markets: botState.markets,
+    markets: marketsWithUpdatedTime,
     trades: botState.trades.slice(0, 50),
     logs: botState.logs.slice(0, 100),
     tradedSlugs: Array.from(botState.tradedSlugs),
@@ -480,7 +499,8 @@ app.get('/api/state', (req, res) => {
     currentSlugs: slugs,
     timeToEnd,
     endTimestamp,
-    serverTime: new Date().toISOString()
+    serverTime: new Date().toISOString(),
+    lastSuccessfulFetch: botState.lastSuccessfulFetch
   });
 });
 
@@ -534,7 +554,9 @@ app.post('/api/bot/start', async (req, res) => {
     `⚙️ ≥${(botState.settings.probabilityThreshold * 100).toFixed(0)}% & ≤${botState.settings.timeThresholdSeconds}s`
   );
   
-  monitorMarkets();
+  // Initial fetch
+  await monitorMarkets();
+  
   botState.intervalId = setInterval(monitorMarkets, botState.settings.pollIntervalMs);
   
   res.json({ success: true });
