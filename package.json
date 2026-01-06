@@ -1,0 +1,16 @@
+{
+  "name": "polymarket-bot",
+  "version": "1.0.0",
+  "description": "Polymarket 15-minute market sniper bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ethers": "^5.7.2",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
