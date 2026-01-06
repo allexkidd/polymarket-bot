@@ -1,6 +1,9 @@
 /**
  * POLYMARKET SNIPER BOT
  * Automatically trades 15-minute crypto markets when probability >= 95% and time <= 60s
+ * 
+ * SLUG FORMAT: {crypto}-updown-15m-{UTC_START_TIMESTAMP}
+ * The timestamp is the START of the 15-minute window in UTC
  */
 
 const express = require('express');
@@ -91,7 +94,8 @@ const botState = {
   },
   
   intervalId: null,
-  lastSuccessfulFetch: null
+  lastSuccessfulFetch: null,
+  lastSlugTimestamp: null
 };
 
 // ============================================
@@ -117,25 +121,38 @@ function addLog(message, type = 'info') {
 
 function calculateCurrentSlugs() {
   const now = new Date();
-  const currentMinutes = now.getMinutes();
+  const currentTimestamp = Math.floor(now.getTime() / 1000);
   
-  // Find the current 15-minute window end
-  const windowIndex = Math.floor(currentMinutes / 15);
-  const windowEnd = (windowIndex + 1) * 15;
+  // Round DOWN to nearest 15-minute mark (900 seconds)
+  // This gives us the START timestamp of the current window
+  const startTimestamp = Math.floor(currentTimestamp / 900) * 900;
   
-  const endTime = new Date(now);
-  endTime.setMinutes(windowEnd, 0, 0);
+  // End timestamp is start + 15 minutes (900 seconds)
+  const endTimestamp = startTimestamp + 900;
   
-  // If we're very close to the end, also look at next window
-  const timeToEnd = (endTime.getTime() - now.getTime()) / 1000;
+  // Time remaining until this window closes
+  const timeToEnd = endTimestamp - currentTimestamp;
   
-  const endTimestamp = Math.floor(endTime.getTime() / 1000);
-  
+  // Generate slugs for all cryptos
   const slugs = botState.settings.cryptos.map(crypto => 
-    `${crypto}-updown-15m-${endTimestamp}`
+    `${crypto}-updown-15m-${startTimestamp}`
   );
   
-  return { slugs, endTime, timeToEnd, endTimestamp };
+  // Log when we switch to a new window
+  if (startTimestamp !== botState.lastSlugTimestamp) {
+    const startDate = new Date(startTimestamp * 1000);
+    const endDate = new Date(endTimestamp * 1000);
+    addLog(`New window: ${startDate.toISOString().slice(11,16)} - ${endDate.toISOString().slice(11,16)} UTC`, 'info');
+    botState.lastSlugTimestamp = startTimestamp;
+  }
+  
+  return { 
+    slugs, 
+    startTimestamp,
+    endTimestamp,
+    timeToEnd,
+    currentTimestamp
+  };
 }
 
 // ============================================
@@ -145,7 +162,6 @@ function calculateCurrentSlugs() {
 async function sendTelegram(message) {
   const { telegramBotToken, telegramChatId } = botState.settings;
   if (!telegramBotToken || !telegramChatId) {
-    addLog('Telegram not configured', 'warning');
     return false;
   }
   
@@ -180,7 +196,8 @@ async function sendTelegram(message) {
 
 async function fetchMarketData() {
   try {
-    const { slugs } = calculateCurrentSlugs();
+    const { slugs, startTimestamp } = calculateCurrentSlugs();
+    
     const slugParams = slugs.map(s => `slug=${encodeURIComponent(s)}`).join('&');
     const url = `${CONFIG.GAMMA_API}/events?${slugParams}`;
     
@@ -189,10 +206,15 @@ async function fetchMarketData() {
     
     const data = await response.json();
     botState.lastSuccessfulFetch = Date.now();
+    
+    if (data.length === 0) {
+      addLog(`No markets found for timestamp ${startTimestamp}`, 'warning');
+    }
+    
     return data;
   } catch (error) {
     addLog(`API error: ${error.message}`, 'error');
-    return null; // Return null to keep existing markets
+    return null;
   }
 }
 
@@ -213,6 +235,9 @@ function processMarkets(events) {
 
         const endDateMs = new Date(market.endDate).getTime();
         const timeRemaining = (endDateMs - now) / 1000;
+        
+        // Skip markets that have already ended
+        if (timeRemaining < -60) continue;
         
         const upPrice = parseFloat(prices[0]);
         const downPrice = parseFloat(prices[1]);
@@ -441,13 +466,15 @@ async function monitorMarkets() {
   
   // Only update markets if we got valid data
   if (events !== null && Array.isArray(events)) {
-    const newMarkets = processMarkets(events);
-    if (newMarkets.length > 0 || events.length === 0) {
-      botState.markets = newMarkets;
-    }
+    botState.markets = processMarkets(events);
   }
   
-  const { slugs, timeToEnd } = calculateCurrentSlugs();
+  // Update time remaining for existing markets
+  const now = Date.now();
+  botState.markets = botState.markets.map(m => ({
+    ...m,
+    timeRemaining: (new Date(m.endDate).getTime() - now) / 1000
+  }));
   
   for (const market of botState.markets) {
     if (botState.tradedSlugs.has(market.slug)) continue;
@@ -457,7 +484,7 @@ async function monitorMarkets() {
     const meetsTime = market.timeRemaining > 0 && market.timeRemaining <= botState.settings.timeThresholdSeconds;
     
     if (meetsProb && meetsTime) {
-      addLog(`🚨 SIGNAL: ${market.crypto} ${market.highProbSide}`, 'trade');
+      addLog(`🚨 SIGNAL: ${market.crypto} ${market.highProbSide} @ ${(market.highProb * 100).toFixed(1)}%`, 'trade');
       
       if (botState.wallet && botState.apiCredentials) {
         const result = await executeTrade(market);
@@ -477,7 +504,7 @@ async function monitorMarkets() {
 
 // Get state
 app.get('/api/state', (req, res) => {
-  const { slugs, timeToEnd, endTimestamp } = calculateCurrentSlugs();
+  const { slugs, timeToEnd, startTimestamp, endTimestamp } = calculateCurrentSlugs();
   
   // Update time remaining for each market
   const now = Date.now();
@@ -498,6 +525,7 @@ app.get('/api/state', (req, res) => {
     stats: botState.stats,
     currentSlugs: slugs,
     timeToEnd,
+    startTimestamp,
     endTimestamp,
     serverTime: new Date().toISOString(),
     lastSuccessfulFetch: botState.lastSuccessfulFetch
@@ -592,11 +620,14 @@ app.post('/api/telegram/test', async (req, res) => {
 // ============================================
 
 app.listen(CONFIG.PORT, () => {
+  const { slugs, timeToEnd } = calculateCurrentSlugs();
   console.log('');
   console.log('═══════════════════════════════════════════════════════');
   console.log('       POLYMARKET SNIPER BOT                           ');
   console.log('═══════════════════════════════════════════════════════');
   console.log('');
   console.log(`  🌐 Server running on port ${CONFIG.PORT}`);
+  console.log(`  📊 Current slugs: ${slugs[0]}`);
+  console.log(`  ⏱  Time to window end: ${Math.floor(timeToEnd)}s`);
   console.log('');
 });
